@@ -30,11 +30,50 @@ def lime_explain_instance(X_train, feature_names, class_names, predict_proba_fn,
 def shap_explain_instance_tree(model, X_background, x_instance):
     # TreeSHAP for tree models (RF, XGBoost)
     t0 = time.perf_counter()
-    explainer = shap.TreeExplainer(model, data=X_background)
-    shap_values = explainer.shap_values(x_instance.reshape(1, -1))
+    # Coerce background and instance to numeric arrays; provide helpful error if conversion fails
+    try:
+        import pandas as _pd
+        if isinstance(X_background, _pd.DataFrame):
+            Xb = X_background.values.astype(np.float64)
+        else:
+            Xb = np.asarray(X_background, dtype=np.float64)
+        xi = np.asarray(x_instance.reshape(1, -1), dtype=np.float64)
+    except Exception as e:
+        raise ValueError(
+            "SHAP TreeExplainer requires numeric feature arrays (float). "
+            "Ensure preprocessing has converted all features to numeric types. "
+            f"Conversion error: {e}"
+        )
+
+    explainer = shap.TreeExplainer(model, data=Xb)
+    shap_values = explainer.shap_values(xi)
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     # shap_values can be list for multiclass; for binary, may be array or list
+    return shap_values, latency_ms
+
+
+def shap_explain_instance_kernel(predict_proba_fn, X_background, x_instance, nsamples=100):
+    """Kernel SHAP for non-tree models. """
+    t0 = time.perf_counter()
+    # Coerce background and instance to numeric arrays; provide helpful error if conversion fails
+    try:
+        import pandas as _pd
+        if isinstance(X_background, _pd.DataFrame):
+            Xb = X_background.values.astype(np.float64)
+        else:
+            Xb = np.asarray(X_background, dtype=np.float64)
+        xi = np.asarray(x_instance.reshape(1, -1), dtype=np.float64)
+    except Exception as e:
+        raise ValueError(
+            "KernelSHAP requires numeric feature arrays (float). Ensure preprocessing produces numeric features. "
+            f"Conversion error: {e}"
+        )
+
+    # KernelExplainer can be slow; use a small background sample.
+    explainer = shap.KernelExplainer(predict_proba_fn, Xb)
+    shap_values = explainer.shap_values(xi, nsamples=nsamples)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
     return shap_values, latency_ms
 
 def topk_from_lime(lime_list, k=10):
