@@ -1,0 +1,86 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+.env
+.env.local
+.env.*.local
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+*.log
+
+# Test and coverage reports
+.coverage
+*.cover
+nosetests.xml
+test-results/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python egg files
+*.egg
+*.egg-info/
+
+# MyPy
+.mypy_cache/
+
+# Pytest
+.cache/
+
+# Virtualenv created in-project
+/pyvenv.cfg
+/bin/
+/lib/
+/lib64/
+lib
+lib64
+/include/
+/pip-selfcheck.json
+/pip-wheel-metadata/
+/*.dist-info/
+
+# Package metadata and wheels
+*.whl
+pip-wheel-metadata/
+
+# Streamlit
+.streamlit/
+
+# System install artifacts created by pip when installing into project
+/etc/
+/share/
+
+# pip logs
+pip-log.txt
+
+matplotlibrc
+
+outputs/
+*.log
+*.jsonl
+*.csv
+
+.DS_Store
+Thumbs.db
+
+xai-audit/
+
+# Ignore seaborn package
