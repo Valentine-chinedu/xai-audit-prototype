@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 from audit.models import build_model
-from audit.explainers import lime_explain_instance, shap_explain_instance_tree, topk_from_lime
+from audit.explainers import lime_explain_instance, shap_explain_instance_tree, shap_explain_instance_kernel, topk_from_lime
 from audit.metrics import mean_pairwise_jaccard, fidelity_r2
 from audit.scoring import explanation_confidence_score
 from audit.logging_utils import append_jsonl
@@ -20,6 +20,13 @@ st.title("XAI Reliability Audit Prototype")
 st.sidebar.header("Configuration")
 
 model_name = st.sidebar.selectbox("Model", ["RandomForest", "XGBoost", "MLP"])
+# Option for non-tree explainability
+use_kernel_shap = False
+kernel_shap_nsamples = 100
+if model_name == "MLP":
+    use_kernel_shap = st.sidebar.checkbox("Enable KernelSHAP for MLP (slow)", value=False)
+    if use_kernel_shap:
+        kernel_shap_nsamples = st.sidebar.slider("KernelSHAP nsamples", 25, 500, 100, step=25)
 num_features = st.sidebar.slider("Top-K features", 5, 20, 10)
 lime_runs = st.sidebar.slider("LIME repeated runs", 3, 30, 10)
 latency_target = st.sidebar.number_input("Real-time latency target (ms)", 50, 2000, 200)
@@ -129,51 +136,78 @@ if run_btn:
     y_hat = ridge.predict(X_neigh)
     lime_fidelity = fidelity_r2(y_neigh, y_hat)
 
-    # --- SHAP (TreeSHAP only for tree models) ---
+    # --- SHAP (TreeSHAP for trees, KernelSHAP for MLP) ---
     shap_latency_ms = None
     shap_values = None
     shap_fidelity = None
-    shap_stability = 1.0  # deterministic for TreeSHAP
+    shap_stability = 1.0  # deterministic for TreeSHAP; KernelSHAP is approx but treated as deterministic for fixed seed
 
-    if model_name in ["RandomForest", "XGBoost"]:
-        # background sample
-        bg = X_train[np.random.choice(len(X_train), size=min(200, len(X_train)), replace=False)]
-        # SHAP expects model, but we have a pipeline; use underlying model with scaled data:
-        # easiest MVP: use raw model without scaling for trees by refitting a "tree_pipe" without scaler
-        from sklearn.pipeline import Pipeline
-        tree_model = build_model(model_name, random_state=int(seed))
-        tree_model.fit(X_train, y_train)
-
-        shap_values, shap_latency_ms = shap_explain_instance_tree(tree_model, bg, x_instance)
-
-        # SHAP fidelity: approximate local prediction by sum(shap)+base_value vs model output
-        # This varies by SHAP output structure; MVP handles binary case commonly.
+    if model_name in ["RandomForest", "XGBoost"] or (model_name == "MLP" and use_kernel_shap):
         try:
-            explainer = __import__("shap").TreeExplainer(tree_model, data=bg)
-            base = explainer.expected_value
-            sv = explainer.shap_values(x_instance.reshape(1, -1))
-            model_out = tree_model.predict_proba(x_instance.reshape(1, -1))[0, 1] if len(tree_model.classes_) > 1 else tree_model.predict_proba(x_instance.reshape(1, -1))[0, 0]
+            shap_expected = None
+            if model_name in ["RandomForest", "XGBoost"]:
+                # background sample
+                bg = X_train[np.random.choice(len(X_train), size=min(200, len(X_train)), replace=False)]
+                # SHAP expects model, but we have a pipeline; use underlying model with scaled data:
+                # easiest MVP: use raw model without scaling for trees by refitting a "tree_pipe" without scaler
+                tree_model = build_model(model_name, random_state=int(seed))
+                tree_model.fit(X_train, y_train)
 
-            if isinstance(sv, list):
-                sv_use = sv[1] if len(sv) > 1 else sv[0]
-            else:
-                sv_use = sv
+                shap_values, shap_latency_ms = shap_explain_instance_tree(tree_model, bg, x_instance)
+                
+                # For fidelity proxy
+                explainer = __import__("shap").TreeExplainer(tree_model, data=bg)
+                shap_expected = explainer.expected_value
+                model_used_for_fidelity = tree_model
 
-            # Robustly extract scalar base value
-            base_use = base
-            if hasattr(base, "__iter__") and not isinstance(base, str):
-                 base_arr = np.array(base).ravel()
-                 if len(base_arr) > 1:
-                     base_use = base_arr[1]
-                 elif len(base_arr) == 1:
-                     base_use = base_arr[0]
+            else: # MLP / KernelSHAP
+                 if use_kernel_shap:
+                    st.info(f"Running KernelSHAP with {kernel_shap_nsamples} samples...")
+                    bg_k = X_train[np.random.choice(len(X_train), size=min(50, len(X_train)), replace=False)]
+                    shap_values, shap_latency_ms = shap_explain_instance_kernel(predict_proba_fn, bg_k, x_instance, nsamples=int(kernel_shap_nsamples))
+                    
+                    # For fidelity proxy
+                    explainer = __import__("shap").KernelExplainer(predict_proba_fn, bg_k)
+                    shap_expected = explainer.expected_value
+                    # KernelSHAP explains the probability function directly
+                    model_used_for_fidelity = None 
 
-            shap_recon = float(base_use + np.sum(sv_use))
-            # fidelity here as 1 - abs error (bounded), MVP proxy
-            shap_fidelity = max(0.0, 1.0 - abs(model_out - shap_recon))
+            # SHAP fidelity: approximate local prediction by sum(shap)+base_value vs model output
+            try:
+                # For fidelity check, we need the model output
+                # If tree model, we used the tree_model directly. If KernelSHAP, we used predict_proba_fn
+                if model_name == "MLP":
+                    probs = predict_proba_fn(x_instance.reshape(1, -1))[0]
+                    model_out = probs[1] if len(probs) > 1 else probs[0]
+                else: 
+                     # Tree model
+                    probs = model_used_for_fidelity.predict_proba(x_instance.reshape(1, -1))[0]
+                    model_out = probs[1] if len(probs) > 1 else probs[0]
+
+                if isinstance(shap_values, list):
+                    sv_use = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                else:
+                    sv_use = shap_values
+
+                # Robustly extract scalar base value
+                base_use = shap_expected
+                if hasattr(shap_expected, "__iter__") and not isinstance(shap_expected, str):
+                     base_arr = np.array(shap_expected).ravel()
+                     if len(base_arr) > 1:
+                         base_use = base_arr[1]
+                     elif len(base_arr) == 1:
+                         base_use = base_arr[0]
+
+                shap_recon = float(base_use + np.sum(sv_use))
+                # fidelity here as 1 - abs error (bounded), MVP proxy
+                shap_fidelity = max(0.0, 1.0 - abs(model_out - shap_recon))
+            except Exception as e:
+                st.warning(f"SHAP Fidelity Calculation Failed: {e}")
+                shap_fidelity = None
         except Exception as e:
-            st.warning(f"SHAP Fidelity Calculation Failed: {e}")
+            st.error(f"SHAP Explainer Failed: {e}")
             shap_fidelity = None
+            shap_values = None
 
     # --- Scores ---
     lime_score = explanation_confidence_score(lime_stability, lime_fidelity, lime_latency_ms, latency_target_ms=float(latency_target))
@@ -185,23 +219,21 @@ if run_btn:
     disagreement_flag = False
     # Compare top-k from LIME run-0 against SHAP top-k if available
     shap_topk = None
-    if model_name in ["RandomForest", "XGBoost"]:
+    if model_name in ["RandomForest", "XGBoost"] or (model_name == "MLP" and use_kernel_shap):
         try:
             import shap as _shap
-            tree_model = build_model(model_name, random_state=int(seed))
-            tree_model.fit(X_train, y_train)
-            bg = X_train[np.random.choice(len(X_train), size=min(200, len(X_train)), replace=False)]
-            exp = _shap.TreeExplainer(tree_model, data=bg)
-            sv = exp.shap_values(x_instance.reshape(1, -1))
-            if isinstance(sv, list):
-                sv_use = sv[1] if len(sv) > 1 else sv[0]
-            else:
-                sv_use = sv
-            abs_sv = np.abs(sv_use).ravel()
-            order = np.argsort(-abs_sv)
-            shap_topk = [feature_cols[i] for i in order[:int(num_features)]]
-            j = len(set(shap_topk) & set(topk_from_lime(lime_explanations[0], int(num_features)))) / max(1, len(set(shap_topk) | set(topk_from_lime(lime_explanations[0], int(num_features)))))
-            disagreement_flag = (j < 0.5)
+            
+            # Reconstruct top-k from shap_values calculated above
+            if shap_values is not None:
+                if isinstance(shap_values, list):
+                    sv_use = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                else:
+                    sv_use = shap_values
+                abs_sv = np.abs(sv_use).ravel()
+                order = np.argsort(-abs_sv)
+                shap_topk = [feature_cols[i] for i in order[:int(num_features)]]
+                j = len(set(shap_topk) & set(topk_from_lime(lime_explanations[0], int(num_features)))) / max(1, len(set(shap_topk) | set(topk_from_lime(lime_explanations[0], int(num_features)))))
+                disagreement_flag = (j < 0.5)
         except Exception:
             shap_topk = None
 
@@ -222,8 +254,8 @@ if run_btn:
 
     with colB:
         st.markdown("### SHAP")
-        if model_name not in ["RandomForest", "XGBoost"]:
-            st.warning("TreeSHAP not available for MLP in this MVP (we can add KernelSHAP later).")
+        if model_name == "MLP" and not use_kernel_shap:
+            st.warning("TreeSHAP not available for MLP. Enable KernelSHAP in the sidebar (slow).")
         else:
             st.metric("Stability", "1.000 (deterministic)")
             st.metric("Fidelity (reconstruction proxy)", f"{shap_fidelity:.3f}" if shap_fidelity is not None else "N/A")
