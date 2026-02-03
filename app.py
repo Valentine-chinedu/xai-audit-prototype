@@ -4,7 +4,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
 
 from audit.models import build_model
@@ -13,7 +13,139 @@ from audit.metrics import mean_pairwise_jaccard, fidelity_r2
 from audit.scoring import explanation_confidence_score
 from audit.logging_utils import append_jsonl
 
-st.set_page_config(page_title="XAI Reliability Audit", layout="wide")
+from audit.logging_utils import append_jsonl
+
+def safe_float(val):
+    """Robustly convert value to float, handling strings with brackets e.g. '[0.5]'."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        # handle string representations of lists/arrays
+        if isinstance(val, str):
+            val = val.strip(" []'\"")
+            try:
+                return float(val)
+            except ValueError:
+                pass
+        return 0.0
+
+@st.cache_data
+def load_demo_data():
+    # MVP demo: synthetic dataset if no CSV is provided
+    from sklearn.datasets import make_classification
+    X, y = make_classification(
+        n_samples=2000, n_features=20, n_informative=10,
+        n_redundant=5, random_state=42
+    )
+    cols = [f"f{i}" for i in range(X.shape[1])]
+    df = pd.DataFrame(X, columns=cols)
+    df["target"] = y
+    df["target"] = y
+    return df, cols, "target"
+
+def clean_uploaded_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Drop common junk index columns
+    junk_cols = [c for c in df.columns if c.lower().startswith("unnamed")]
+    if junk_cols:
+        df = df.drop(columns=junk_cols)
+        
+    # Also drop a pure index column if it looks like 0..n-1
+    for c in df.columns[:2]:
+        if pd.api.types.is_numeric_dtype(df[c]) and df[c].is_unique:
+            vals = df[c].values
+            if len(vals) > 3 and np.all(vals[:3] == np.array([0, 1, 2])):  # quick heuristic
+                df = df.drop(columns=[c])
+                break
+    return df
+
+def preprocess_for_modeling(df: pd.DataFrame, target_col: str):
+    """Prepare dataframe for modeling:
+    - Convert target to numeric when it's clearly continuous
+    - Drop rows with missing targets
+    - Drop columns with excessive missing values
+    - Keep numeric features; one-hot encode low-cardinality categoricals
+    - Simple imputation for remaining missing values
+    - Drop very high-cardinality non-numeric columns
+    """
+    df = df.copy()
+
+    # Coerce target
+    y_raw = df[target_col]
+    y_num = pd.to_numeric(y_raw, errors="coerce")
+    
+    # Heuristic for continuous vs classification target
+    target_is_continuous = False
+    if y_num.notna().sum() >= len(df) * 0.9 and y_num.nunique(dropna=True) > 10:
+        df[target_col] = y_num
+        target_is_continuous = True
+    else:
+        if y_num.notna().all():
+            df[target_col] = y_num
+            target_is_continuous = y_num.nunique(dropna=True) > 10
+
+    # Drop missing taxrget
+    df = df.dropna(subset=[target_col])
+    
+    # Drop empty cols
+    missing_frac = df.isna().mean()
+    drop_cols = list(missing_frac[missing_frac > 0.5].index)
+    if drop_cols:
+         st.warning(f"Dropping columns with >50% missing values: {', '.join(drop_cols)}")
+         df = df.drop(columns=drop_cols)
+
+    # Features
+    feature_cols = [c for c in df.columns if c != target_col]
+    numeric_cols = []
+    low_card_cats = []
+    high_card_cats = []
+
+    for c in feature_cols:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            numeric_cols.append(c)
+            continue
+        # Try coercing
+        conv = pd.to_numeric(df[c], errors="coerce")
+        if conv.notna().sum() >= len(df) * 0.9:
+            df[c] = conv
+            numeric_cols.append(c)
+            continue
+        
+        # Categorical
+        if df[c].nunique(dropna=True) <= 20: 
+            low_card_cats.append(c)
+        else:
+            high_card_cats.append(c)
+            
+    if high_card_cats:
+        st.warning(f"Dropping high-cardinality non-numeric columns: {', '.join(high_card_cats)}")
+        df = df.drop(columns=high_card_cats)
+        
+    # Impute numeric
+    for c in numeric_cols:
+        if c in df.columns and df[c].isna().any():
+            df[c] = df[c].fillna(df[c].median())
+            
+    # Impute/Encode cats
+    if low_card_cats:
+        cols_to_encode = [c for c in low_card_cats if c in df.columns]
+        if cols_to_encode:
+            # fillna before dummy
+            for c in cols_to_encode:
+                df[c] = df[c].fillna("__MISSING__")
+            df = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
+
+    feature_cols = [c for c in df.columns if c != target_col]
+    
+    # Final cleanup
+    if feature_cols and df[feature_cols].isna().any().any():
+        for c in feature_cols:
+            if df[c].isna().any():
+                 if pd.api.types.is_numeric_dtype(df[c]):
+                      df[c] = df[c].fillna(0)
+                 else:
+                      df[c] = df[c].fillna("0")
+                      
+    return df, feature_cols, target_is_continuous
 st.title("XAI Reliability Audit Prototype")
 
 # --- Sidebar controls ---
@@ -35,35 +167,53 @@ seed = st.sidebar.number_input("Base random seed", 0, 9999, 42)
 
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
-target_col = st.sidebar.text_input("Target column name (for CSV)", value="target")
 
-@st.cache_data
-def load_demo_data():
-    # MVP demo: synthetic dataset if no CSV is provided
-    from sklearn.datasets import make_classification
-    X, y = make_classification(
-        n_samples=2000, n_features=20, n_informative=10,
-        n_redundant=5, random_state=42
-    )
-    cols = [f"f{i}" for i in range(X.shape[1])]
-    df = pd.DataFrame(X, columns=cols)
-    df["target"] = y
-    return df, cols, "target"
-
+# Logic to handle data loading and target selection
 if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    if target_col not in df.columns:
-        st.error(f"Target column '{target_col}' not found in uploaded CSV.")
+    try:
+        # Read plain dataframe first to get columns
+        df_raw = pd.read_csv(uploaded)
+        df_raw = clean_uploaded_df(df_raw)
+        
+        all_cols = list(df_raw.columns)
+        
+        # Heuristic for default target
+        default_ix = 0
+        for i, c in enumerate(all_cols):
+            if c.lower() in ["target", "label", "class", "y", "two_year_recid", "recid", "outcome"]:
+                default_ix = i
+                break
+                
+        target_col = st.sidebar.selectbox("Select Target Column", all_cols, index=default_ix)
+        
+        df, feature_cols, target_is_continuous = preprocess_for_modeling(df_raw, target_col)
+        
+    except Exception as e:
+        st.error(f"Error processing CSV: {e}")
         st.stop()
-    feature_cols = [c for c in df.columns if c != target_col]
 else:
     df, feature_cols, target_col = load_demo_data()
+    target_is_continuous = False
 
 st.subheader("Dataset Preview")
 st.dataframe(df.head(10), use_container_width=True)
 
 X = df[feature_cols].values
+try:
+    X = X.astype(np.float64)
+except ValueError as e:
+    st.error(f"Failed to convert features to numeric. Check for remaining non-numeric columns. Error: {e}")
+    st.stop()
 y = df[target_col].values
+
+# Encode target for classification
+if not locals().get('target_is_continuous', False):
+    le = LabelEncoder()
+    y = le.fit_transform(y)
+    class_names = [str(c) for c in le.classes_]
+else:
+    # Regression or manual binning
+    class_names = [str(c) for c in np.unique(y)]
 
 # split
 X_train, X_test, y_train, y_test = train_test_split(
@@ -189,6 +339,14 @@ if run_btn:
                 else:
                     sv_use = shap_values
 
+                # Clean shap_values array (values might be strings '[0.01]')
+                try:
+                    sv_use = np.array(sv_use, dtype=float)
+                except (ValueError, TypeError):
+                    # Fallback to element-wise cleaning
+                    vf = np.vectorize(safe_float)
+                    sv_use = vf(sv_use)
+
                 # Robustly extract scalar base value
                 base_use = shap_expected
                 if hasattr(shap_expected, "__iter__") and not isinstance(shap_expected, str):
@@ -197,8 +355,11 @@ if run_btn:
                          base_use = base_arr[1]
                      elif len(base_arr) == 1:
                          base_use = base_arr[0]
-
-                shap_recon = float(base_use + np.sum(sv_use))
+                
+                # Use safe_float to handle brackets in string output
+                base_val = safe_float(base_use)
+                
+                shap_recon = float(base_val + np.sum(sv_use))
                 # fidelity here as 1 - abs error (bounded), MVP proxy
                 shap_fidelity = max(0.0, 1.0 - abs(model_out - shap_recon))
             except Exception as e:
@@ -259,7 +420,7 @@ if run_btn:
         else:
             st.metric("Stability", "1.000 (deterministic)")
             st.metric("Fidelity (reconstruction proxy)", f"{shap_fidelity:.3f}" if shap_fidelity is not None else "N/A")
-            st.metric("Latency (ms)", f"{float(shap_latency_ms):.1f}")
+            st.metric("Latency (ms)", f"{float(shap_latency_ms):.1f}" if shap_latency_ms is not None else "N/A")
             st.metric("Explanation Confidence Score", f"{shap_score:.3f}" if shap_score is not None else "N/A")
             if shap_topk:
                 st.write("Top-K features (SHAP |abs|):")
@@ -296,5 +457,97 @@ if run_btn:
         "seed": int(seed),
     }
     append_jsonl(record)
+    
+    # --- Save state for persistence ---
+    st.session_state["audit_results"] = {
+        "lime_stability": lime_stability,
+        "lime_fidelity": lime_fidelity,
+        "lime_latency_ms": lime_latency_ms,
+        "lime_score": lime_score,
+        "lime_explanations": lime_explanations,
+        "lime_latencies": lime_latencies,
+        "shap_stability": shap_stability,
+        "shap_fidelity": shap_fidelity,
+        "shap_latency_ms": shap_latency_ms,
+        "shap_score": shap_score,
+        "shap_topk": shap_topk,
+        "disagreement_flag": disagreement_flag,
+        "sv_use": sv_use if 'sv_use' in locals() else None,
+        "feature_cols": feature_cols,
+        "model_name_run": model_name,
+        "idx_run": idx
+    }
+
+if "audit_results" in st.session_state:
+    res = st.session_state["audit_results"]
+    lime_stability = res["lime_stability"]
+    lime_fidelity = res["lime_fidelity"]
+    lime_latency_ms = res["lime_latency_ms"]
+    lime_score = res["lime_score"]
+    lime_explanations = res["lime_explanations"]
+    lime_latencies = res["lime_latencies"]
+    shap_stability = res["shap_stability"]
+    shap_fidelity = res["shap_fidelity"]
+    shap_latency_ms = res["shap_latency_ms"]
+    shap_score = res["shap_score"]
+    shap_topk = res["shap_topk"]
+    disagreement_flag = res["disagreement_flag"]
+    sv_use = res["sv_use"]
+    feature_cols_run = res["feature_cols"]
+    model_name_run = res["model_name_run"]
+    idx_run = res["idx_run"]
+    
+    # append_jsonl(record) -> Removed to prevent re-logging on refresh
 
     st.caption("Run logged to outputs/runs.jsonl")
+
+    # --- Download Buttons ---
+    st.markdown("---")
+    st.subheader("Downloads")
+    
+    # 1. Download full audit log
+    runs_path = "outputs/runs.jsonl"
+    try:
+        with open(runs_path, "r") as f:
+            runs_data = f.read()
+        st.download_button(
+            label="Download Full Audit Log (JSONL)",
+            data=runs_data,
+            file_name="audit_runs.jsonl",
+            mime="application/json"
+        )
+    except FileNotFoundError:
+        st.caption("No audit log found yet.")
+
+    # 2. Download current explanations
+    lime_df = pd.DataFrame(lime_explanations[0], columns=["Feature", "Weight"])
+    st.download_button(
+        label="Download LIME Explanations (CSV)",
+        data=lime_df.to_csv(index=False),
+        file_name=f"lime_explanation_{model_name_run}_{idx_run}.csv",
+        mime="text/csv"
+    )
+
+    if shap_topk:
+        # Reconstruct full SHAP df if possible, or just top-k
+        # For MVP we just reused top-k in display, but let's try to pass the full values if available
+        # We reused sv_use and feature_cols earlier
+        try:
+            # sv_use is already clean numpy array here
+            # feature_cols is full list
+             shap_df = pd.DataFrame({
+                 "Feature": feature_cols_run,
+                 "SHAP Value": sv_use.ravel()
+             })
+             # Sort by magnitude
+             shap_df["Abs"] = shap_df["SHAP Value"].abs()
+             shap_df = shap_df.sort_values("Abs", ascending=False).drop(columns=["Abs"])
+             
+             st.download_button(
+                label="Download SHAP Explanations (CSV)",
+                data=shap_df.to_csv(index=False),
+                file_name=f"shap_explanation_{model_name_run}_{idx_run}.csv",
+                mime="text/csv"
+            )
+        except Exception:
+            pass
