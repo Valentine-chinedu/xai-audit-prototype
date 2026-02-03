@@ -42,9 +42,14 @@ def shap_explain_instance_kernel(predict_proba_fn, X_background, x_instance, nsa
     t0 = time.perf_counter()
     # KernelExplainer expects a function and a background dataset
     explainer = shap.KernelExplainer(predict_proba_fn, X_background)
-    shap_values = explainer.shap_values(x_instance, nsamples=nsamples)
+    
+    # Reshape to 2D (1, n_features) as safe practice
+    x_2d = x_instance.reshape(1, -1)
+    
+    shap_values = explainer.shap_values(x_2d, nsamples=nsamples)
     latency_ms = (time.perf_counter() - t0) * 1000.0
-    return shap_values, latency_ms
+    
+    return shap_values, explainer.expected_value, latency_ms
 
 def topk_from_lime(lime_list, k=10):
     # lime_list: [(feature_desc, weight), ...]
