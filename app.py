@@ -217,8 +217,10 @@ else:
     class_names = [str(c) for c in np.unique(y)]
 
 # split
+# split
+stratify_y = y if (len(np.unique(y)) > 1 and np.min(np.unique(y, return_counts=True)[1]) > 1) else None
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.25, random_state=int(seed), stratify=y if len(np.unique(y)) > 1 else None
+    X, y, test_size=0.25, random_state=int(seed), stratify=stratify_y
 )
 
 # pipeline: scale for MLP; scaling doesn't harm trees much for MVP
@@ -315,12 +317,13 @@ if run_btn:
                  if use_kernel_shap:
                     st.info(f"Running KernelSHAP with {kernel_shap_nsamples} samples...")
                     bg_k = X_train[np.random.choice(len(X_train), size=min(50, len(X_train)), replace=False)]
-                    shap_values, shap_latency_ms = shap_explain_instance_kernel(predict_proba_fn, bg_k, x_instance, nsamples=int(kernel_shap_nsamples))
                     
-                    # For fidelity proxy
-                    explainer = __import__("shap").KernelExplainer(predict_proba_fn, bg_k)
-                    shap_expected = explainer.expected_value
-                    # KernelSHAP explains the probability function directly
+                    # Optimized call: returns (shap_values, expected_value, latency)
+                    shap_values, shap_expected, shap_latency_ms = shap_explain_instance_kernel(
+                        predict_proba_fn, bg_k, x_instance, nsamples=int(kernel_shap_nsamples)
+                    )
+                    
+                    # No need to re-instantiate explainer for expected_value!
                     model_used_for_fidelity = None 
 
             # SHAP fidelity: approximate local prediction by sum(shap)+base_value vs model output
@@ -329,15 +332,19 @@ if run_btn:
                 # If tree model, we used the tree_model directly. If KernelSHAP, we used predict_proba_fn
                 if model_name == "MLP":
                     probs = predict_proba_fn(x_instance.reshape(1, -1))[0]
-                    model_out = probs[1] if len(probs) > 1 else probs[0]
                 else: 
                      # Tree model
                     probs = model_used_for_fidelity.predict_proba(x_instance.reshape(1, -1))[0]
-                    model_out = probs[1] if len(probs) > 1 else probs[0]
+                
+                # Dynamic class selection
+                pred_class = np.argmax(probs)
+                model_out = probs[pred_class]
 
                 if isinstance(shap_values, list):
-                    sv_use = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+                    # Multi-output model (e.g. classifier): shap_values is list of arrays
+                    sv_use = shap_values[pred_class]
                 else:
+                    # Single output (e.g. binary classifier just outputting logit or prob)
                     sv_use = shap_values
 
                 # Clean shap_values array (values might be strings '[0.01]')
@@ -353,14 +360,18 @@ if run_btn:
                 if hasattr(shap_expected, "__iter__") and not isinstance(shap_expected, str):
                      base_arr = np.array(shap_expected).ravel()
                      if len(base_arr) > 1:
-                         base_use = base_arr[1]
+                         # Use same class index
+                         base_use = base_arr[pred_class] if pred_class < len(base_arr) else base_arr[0]
                      elif len(base_arr) == 1:
                          base_use = base_arr[0]
                 
                 # Use safe_float to handle brackets in string output
                 base_val = safe_float(base_use)
                 
+                # Clamp reconstruction for probabilities
                 shap_recon = float(base_val + np.sum(sv_use))
+                shap_recon = max(0.0, min(1.0, shap_recon))
+                
                 # fidelity here as 1 - abs error (bounded), MVP proxy
                 shap_fidelity = max(0.0, 1.0 - abs(model_out - shap_recon))
             except Exception as e:
@@ -419,7 +430,12 @@ if run_btn:
         if model_name == "MLP" and not use_kernel_shap:
             st.warning("TreeSHAP not available for MLP. Enable KernelSHAP in the sidebar (slow).")
         else:
-            st.metric("Stability", "1.000 (deterministic)")
+            stab_label = "Stability"
+            if model_name == "MLP" and use_kernel_shap:
+                stab_label = "Approximation (KernelSHAP)"
+                st.metric(stab_label, f"Running with {kernel_shap_nsamples} samples")
+            else:
+                st.metric(stab_label, "1.000 (deterministic)")
             st.metric("Fidelity (reconstruction proxy)", f"{shap_fidelity:.3f}" if shap_fidelity is not None else "N/A")
             st.metric("Latency (ms)", f"{float(shap_latency_ms):.1f}" if shap_latency_ms is not None else "N/A")
             st.metric("Explanation Confidence Score", f"{shap_score:.3f}" if shap_score is not None else "N/A")
