@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import io
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -438,6 +439,12 @@ if run_btn:
     plt.xlabel("LIME Latency (ms)")
     plt.ylabel("Count")
     st.pyplot(fig)
+    
+    # Save high-res plot to bytes for download
+    plot_buf = io.BytesIO()
+    fig.savefig(plot_buf, format="png", dpi=300, bbox_inches="tight")
+    plot_buf.seek(0)
+    plot_bytes = plot_buf.getvalue()
 
     # --- Log run ---
     record = {
@@ -475,7 +482,10 @@ if run_btn:
         "sv_use": sv_use if 'sv_use' in locals() else None,
         "feature_cols": feature_cols,
         "model_name_run": model_name,
-        "idx_run": idx
+        "feature_cols": feature_cols,
+        "model_name_run": model_name,
+        "idx_run": idx,
+        "plot_bytes": plot_bytes
     }
 
 if "audit_results" in st.session_state:
@@ -495,7 +505,10 @@ if "audit_results" in st.session_state:
     sv_use = res["sv_use"]
     feature_cols_run = res["feature_cols"]
     model_name_run = res["model_name_run"]
+    feature_cols_run = res["feature_cols"]
+    model_name_run = res["model_name_run"]
     idx_run = res["idx_run"]
+    plot_bytes = res.get("plot_bytes", None)
     
     # append_jsonl(record) -> Removed to prevent re-logging on refresh
 
@@ -518,6 +531,28 @@ if "audit_results" in st.session_state:
         )
     except FileNotFoundError:
         st.caption("No audit log found yet.")
+        
+    # 1b. Download audit log as CSV
+    try:
+        if runs_path: # check if exists logic from above roughly
+             runs_df = pd.read_json(runs_path, lines=True)
+             st.download_button(
+                 label="Download Audit Log (CSV)",
+                 data=runs_df.to_csv(index=False),
+                 file_name="audit_runs.csv",
+                 mime="text/csv"
+             )
+    except (FileNotFoundError, ValueError):
+        pass
+        
+    # 1c. Download High-Res Plot
+    if 'plot_bytes' in locals() and plot_bytes is not None:
+        st.download_button(
+            label="Download Diagnostic Plot (High-Res PNG)",
+            data=plot_bytes,
+            file_name=f"latency_plot_{model_name_run}_{idx_run}.png",
+            mime="image/png"
+        )
 
     # 2. Download current explanations
     lime_df = pd.DataFrame(lime_explanations[0], columns=["Feature", "Weight"])
