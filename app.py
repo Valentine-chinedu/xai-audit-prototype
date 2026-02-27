@@ -3,32 +3,18 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 import io
+import os
+import time
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
 
 from audit.models import build_model
-from audit.explainers import lime_explain_instance, shap_explain_instance_tree, shap_explain_instance_kernel, topk_from_lime
-from audit.metrics import mean_pairwise_jaccard, fidelity_r2
+from audit.explainers import lime_explain_instance, shap_explain_instance_kernel, topk_from_lime
+from audit.metrics import jaccard, fidelity_r2
 from audit.scoring import explanation_confidence_score
 from audit.logging_utils import append_jsonl
-
-from audit.logging_utils import append_jsonl
-
-def safe_float(val):
-    """Robustly convert value to float, handling strings with brackets e.g. '[0.5]'."""
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        # handle string representations of lists/arrays
-        if isinstance(val, str):
-            val = val.strip(" []'\"")
-            try:
-                return float(val)
-            except ValueError:
-                pass
-        return 0.0
 
 @st.cache_data
 def load_demo_data():
@@ -147,12 +133,28 @@ def preprocess_for_modeling(df: pd.DataFrame, target_col: str):
                       df[c] = df[c].fillna("0")
                       
     return df, feature_cols, target_is_continuous
+
+def training_cache_key(model_name: str, seed: int, X_train: np.ndarray, y_train: np.ndarray):
+    sample_n = int(min(256, len(X_train)))
+    x_sample = X_train[:sample_n]
+    y_sample = y_train[:sample_n]
+    return (
+        model_name,
+        int(seed),
+        tuple(X_train.shape),
+        tuple(y_train.shape),
+        float(np.sum(x_sample)),
+        float(np.mean(x_sample)),
+        float(np.std(x_sample)),
+        float(np.sum(y_sample)),
+    )
+
 st.title("XAI Reliability Audit Prototype")
 
 # --- Sidebar controls ---
 st.sidebar.header("Configuration")
 
-model_name = st.sidebar.selectbox("Model", ["RandomForest", "XGBoost", "MLP"])
+model_name = st.sidebar.selectbox("Model", ["RandomForest", "HistGradientBoosting", "MLP"])
 # Option for non-tree explainability
 use_kernel_shap = False
 kernel_shap_nsamples = 100
@@ -160,14 +162,22 @@ if model_name == "MLP":
     use_kernel_shap = st.sidebar.checkbox("Enable KernelSHAP for MLP (slow)", value=False)
     if use_kernel_shap:
         kernel_shap_nsamples = st.sidebar.slider("KernelSHAP nsamples", 25, 500, 100, step=25)
-num_features = st.sidebar.slider("Top-K features", 5, 20, 10)
-lime_runs = st.sidebar.slider("LIME repeated runs", 3, 30, 10)
+TOP_K = 5
+Fidelity_N = 50
+KERNEL_SHAP_BACKGROUND_SIZE = 50
+BOUNDARY_THRESHOLD = 0.05
+ADDITIVITY_WARNING_THRESHOLD = 1e-2
+AUDIT_SCHEMA = "vB"
+st.sidebar.caption(f"Top-K features fixed to {TOP_K} for evaluation consistency.")
+lime_runs = st.sidebar.slider("LIME repeated runs", 10, 30, 10)
+shap_runs = st.sidebar.slider("SHAP repeated runs", 10, 30, 10)
 latency_target = st.sidebar.number_input("Real-time latency target (ms)", 50, 2000, 200)
 
 seed = st.sidebar.number_input("Base random seed", 0, 9999, 42)
 
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
+clear_log_before_run = st.sidebar.checkbox("Clear audit log before run", value=False)
 
 # Logic to handle data loading and target selection
 if uploaded is not None:
@@ -223,13 +233,24 @@ X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.25, random_state=int(seed), stratify=stratify_y
 )
 
-# pipeline: scale for MLP; scaling doesn't harm trees much for MVP
-model = build_model(model_name, random_state=int(seed))
-pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
-pipe.fit(X_train, y_train)
+# Train once per data/model/seed combo and reuse across Streamlit reruns.
+train_key = training_cache_key(model_name, int(seed), X_train, y_train)
+cached_key = st.session_state.get("trained_model_key")
+if cached_key != train_key:
+    model = build_model(model_name, random_state=int(seed))
+    if model_name == "MLP":
+        fitted_model = Pipeline([("scaler", StandardScaler()), ("model", model)])
+    else:
+        fitted_model = model
+    fitted_model.fit(X_train, y_train)
+    st.session_state["trained_model_key"] = train_key
+    st.session_state["trained_model_obj"] = fitted_model
+else:
+    fitted_model = st.session_state["trained_model_obj"]
 
-predict_proba_fn = lambda X_: pipe.predict_proba(X_)
-predict_fn = lambda X_: pipe.predict(X_)
+predict_proba_fn = lambda X_: fitted_model.predict_proba(X_)
+predict_fn = lambda X_: fitted_model.predict(X_)
+tree_model_main = fitted_model if model_name in ["RandomForest", "HistGradientBoosting"] else None
 
 # choose instance
 st.subheader("Select Instance to Explain")
@@ -238,6 +259,9 @@ x_instance = X_test[int(idx)]
 y_true = y_test[int(idx)]
 pred = predict_fn(x_instance.reshape(1,-1))[0]
 proba = predict_proba_fn(x_instance.reshape(1,-1))[0]
+pred_class_idx = int(np.argmax(proba))
+prediction_confidence = float(proba[pred_class_idx])
+near_boundary = bool(abs(prediction_confidence - 0.5) < BOUNDARY_THRESHOLD)
 
 c1, c2, c3 = st.columns(3)
 c1.metric("True label", int(y_true))
@@ -249,166 +273,360 @@ run_btn = st.button("Run Reliability Audit")
 
 if run_btn:
     st.info("Running audit...")
+    runs_path = "outputs/runs.jsonl"
+    if clear_log_before_run and os.path.exists(runs_path):
+        os.remove(runs_path)
+    def pairwise_jaccard_scores(feature_sets):
+        vals = []
+        n = len(feature_sets)
+        for i in range(n):
+            for j in range(i + 1, n):
+                vals.append(jaccard(feature_sets[i], feature_sets[j]))
+        return vals
+
+    def summarize_latencies(lat_ms):
+        if not lat_ms:
+            return None, None, None
+        arr = np.array(lat_ms, dtype=float)
+        mean_v = float(np.mean(arr))
+        std_v = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+        p95_v = float(np.percentile(arr, 95))
+        return mean_v, std_v, p95_v
+
+    def lime_recon_for_instance(x_row, seed_val):
+        lime_list_i, lime_map_i, _, lime_details_i = lime_explain_instance(
+            X_train=X_train,
+            feature_names=feature_cols,
+            class_names=[str(c) for c in np.unique(y_train)],
+            predict_proba_fn=predict_proba_fn,
+            x_instance=x_row,
+            num_features=int(TOP_K),
+            seed=seed_val,
+        )
+        probs_i = predict_proba_fn(x_row.reshape(1, -1))[0]
+        pred_label_i = int(np.argmax(probs_i))
+        available_labels = list(lime_map_i.keys())
+        target_label_i = pred_label_i if pred_label_i in lime_map_i else (available_labels[0] if available_labels else None)
+        if target_label_i is None:
+            return 0.0, lime_list_i, lime_map_i
+        local_weights = lime_map_i.get(target_label_i, [])
+        contrib_sum = float(np.sum([w for _, w in local_weights])) if local_weights else 0.0
+        intercept_obj = lime_details_i.get("intercept", 0.0) if isinstance(lime_details_i, dict) else 0.0
+        if isinstance(intercept_obj, dict):
+            intercept = float(intercept_obj.get(target_label_i, 0.0))
+        elif isinstance(intercept_obj, (list, np.ndarray)):
+            idx_safe = target_label_i if target_label_i < len(intercept_obj) else 0
+            intercept = float(intercept_obj[idx_safe])
+        else:
+            intercept = float(intercept_obj)
+        recon = float(intercept + contrib_sum)
+        return recon, lime_list_i, lime_map_i
+
+    def normalize_shap_values(shap_values_obj, pred_class):
+        if isinstance(shap_values_obj, list):
+            idx = int(min(max(pred_class, 0), len(shap_values_obj) - 1))
+            arr = np.array(shap_values_obj[idx], dtype=float)
+        else:
+            arr = np.array(shap_values_obj, dtype=float)
+            if arr.ndim == 3:
+                class_idx = int(min(max(pred_class, 0), arr.shape[2] - 1))
+                arr = arr[0, :, class_idx]
+            elif arr.ndim == 2:
+                arr = arr[0]
+        return arr.ravel()
+
+    def normalize_shap_values_row(shap_values_obj, row_idx, pred_class):
+        if isinstance(shap_values_obj, list):
+            class_idx = int(min(max(pred_class, 0), len(shap_values_obj) - 1))
+            arr = np.array(shap_values_obj[class_idx], dtype=float)
+            if arr.ndim == 2:
+                return arr[row_idx].ravel()
+            return arr.ravel()
+        arr = np.array(shap_values_obj, dtype=float)
+        if arr.ndim == 3:
+            class_idx = int(min(max(pred_class, 0), arr.shape[2] - 1))
+            return arr[row_idx, :, class_idx].ravel()
+        if arr.ndim == 2:
+            return arr[row_idx].ravel()
+        return arr.ravel()
+
+    def pick_base_value(expected_value_obj, pred_class):
+        if isinstance(expected_value_obj, (list, np.ndarray)):
+            arr = np.array(expected_value_obj, dtype=float).ravel()
+            if arr.size == 0:
+                return 0.0
+            idx = int(min(max(pred_class, 0), arr.size - 1))
+            return float(arr[idx])
+        return float(expected_value_obj)
+
+    def model_output_for_class(model_obj, x_row, pred_class, output_space):
+        if output_space == "probability":
+            probs_local = model_obj.predict_proba(x_row.reshape(1, -1))[0]
+            idx = int(min(max(pred_class, 0), len(probs_local) - 1))
+            return float(probs_local[idx])
+        raw_local = np.array(model_obj.decision_function(x_row.reshape(1, -1)), dtype=float)
+        if raw_local.ndim == 0:
+            return float(raw_local)
+        if raw_local.ndim == 1:
+            if raw_local.size == 1:
+                return float(raw_local[0])
+            idx = int(min(max(pred_class, 0), raw_local.size - 1))
+            return float(raw_local[idx])
+        if raw_local.shape[1] == 1:
+            return float(raw_local[0, 0])
+        idx = int(min(max(pred_class, 0), raw_local.shape[1] - 1))
+        return float(raw_local[0, idx])
 
     # --- LIME repeated runs (stability + latency avg) ---
     lime_feature_sets = []
     lime_latencies = []
     lime_explanations = []
-
-    class_names = [str(c) for c in np.unique(y_train)]
+    lime_topk_indices_0 = []
     for r in range(int(lime_runs)):
-        lime_list, lat_ms = lime_explain_instance(
+        lime_list, lime_map, lat_ms, _ = lime_explain_instance(
             X_train=X_train,
             feature_names=feature_cols,
-            class_names=class_names,
+            class_names=[str(c) for c in np.unique(y_train)],
             predict_proba_fn=predict_proba_fn,
             x_instance=x_instance,
-            num_features=int(num_features),
-            seed=int(seed) + r
+            num_features=int(TOP_K),
+            seed=int(seed) + r,
         )
         lime_latencies.append(lat_ms)
         lime_explanations.append(lime_list)
-        lime_feature_sets.append(set(topk_from_lime(lime_list, k=int(num_features))))
+        if r == 0:
+            labels = list(lime_map.keys())
+            if labels:
+                first_label = labels[0]
+                sorted_tuples = sorted(lime_map[first_label], key=lambda x: abs(x[1]), reverse=True)
+                lime_topk_indices_0 = [idx for idx, _ in sorted_tuples[:int(TOP_K)]]
+        lime_feature_sets.append(set(topk_from_lime(lime_list, k=int(TOP_K))))
 
-    lime_stability = mean_pairwise_jaccard(lime_feature_sets)
-    lime_latency_ms = float(np.mean(lime_latencies))
+    lime_jaccard_scores = pairwise_jaccard_scores(lime_feature_sets)
+    lime_mean_jaccard = float(np.mean(lime_jaccard_scores)) if lime_jaccard_scores else 1.0
+    lime_std_jaccard = float(np.std(lime_jaccard_scores)) if lime_jaccard_scores else 0.0
+    lime_min_jaccard = float(np.min(lime_jaccard_scores)) if lime_jaccard_scores else 1.0
+    lime_var_jaccard = float(np.var(lime_jaccard_scores)) if lime_jaccard_scores else 0.0
+    lime_is_unstable = lime_var_jaccard > 0.01
+    lime_supports_h1_jaccard = lime_mean_jaccard < 0.9
+    lime_stability = lime_mean_jaccard
+    lime_latency_ms_mean, lime_latency_ms_std, lime_latency_ms_p95 = summarize_latencies(lime_latencies)
+    lime_latency_ms = float(lime_latency_ms_mean) if lime_latency_ms_mean is not None else None
 
-    # --- LIME fidelity ---
-    # Create neighbourhood and see how well LIME surrogate approximates model:
-    # MVP approach: use LIME explanation weights as linear approximation proxy is complex;
-    # For MVP, we compute "local fidelity" by sampling around instance and fitting a linear model.
-    from sklearn.linear_model import Ridge
-    rng = np.random.default_rng(int(seed))
-    n_neigh = 500
-    noise = rng.normal(0, 0.5, size=(n_neigh, X_train.shape[1]))
-    X_neigh = x_instance.reshape(1, -1) + noise
-    y_neigh = predict_proba_fn(X_neigh)[:, 1] if predict_proba_fn(X_neigh).shape[1] > 1 else predict_proba_fn(X_neigh)[:, 0]
-
-    ridge = Ridge(alpha=1.0, random_state=int(seed))
-    ridge.fit(X_neigh, y_neigh)
-    y_hat = ridge.predict(X_neigh)
-    lime_fidelity = fidelity_r2(y_neigh, y_hat)
-
-    # --- SHAP (TreeSHAP for trees, KernelSHAP for MLP) ---
+    # --- SHAP repeated runs (stability + latency avg) ---
+    shap_latencies = []
+    shap_feature_sets = []
+    shap_stability = None
     shap_latency_ms = None
-    shap_values = None
-    shap_fidelity = None
-    shap_stability = 1.0  # deterministic for TreeSHAP; KernelSHAP is approx but treated as deterministic for fixed seed
-
-    if model_name in ["RandomForest", "XGBoost"] or (model_name == "MLP" and use_kernel_shap):
-        try:
-            shap_expected = None
-            if model_name in ["RandomForest", "XGBoost"]:
-                # background sample
-                bg = X_train[np.random.choice(len(X_train), size=min(200, len(X_train)), replace=False)]
-                # SHAP expects model, but we have a pipeline; use underlying model with scaled data:
-                # easiest MVP: use raw model without scaling for trees by refitting a "tree_pipe" without scaler
-                tree_model = build_model(model_name, random_state=int(seed))
-                tree_model.fit(X_train, y_train)
-
-                shap_values, shap_latency_ms = shap_explain_instance_tree(tree_model, bg, x_instance)
-                
-                # For fidelity proxy
-                explainer = __import__("shap").TreeExplainer(tree_model, data=bg)
-                shap_expected = explainer.expected_value
-                model_used_for_fidelity = tree_model
-
-            else: # MLP / KernelSHAP
-                 if use_kernel_shap:
-                    st.info(f"Running KernelSHAP with {kernel_shap_nsamples} samples...")
-                    bg_k = X_train[np.random.choice(len(X_train), size=min(50, len(X_train)), replace=False)]
-                    
-                    # Optimized call: returns (shap_values, expected_value, latency)
-                    shap_values, shap_expected, shap_latency_ms = shap_explain_instance_kernel(
-                        predict_proba_fn, bg_k, x_instance, nsamples=int(kernel_shap_nsamples)
-                    )
-                    
-                    # No need to re-instantiate explainer for expected_value!
-                    model_used_for_fidelity = None 
-
-            # SHAP fidelity: approximate local prediction by sum(shap)+base_value vs model output
-            try:
-                # For fidelity check, we need the model output
-                # If tree model, we used the tree_model directly. If KernelSHAP, we used predict_proba_fn
-                if model_name == "MLP":
-                    probs = predict_proba_fn(x_instance.reshape(1, -1))[0]
-                else: 
-                     # Tree model
-                    probs = model_used_for_fidelity.predict_proba(x_instance.reshape(1, -1))[0]
-                
-                # Dynamic class selection
-                pred_class = np.argmax(probs)
-                model_out = probs[pred_class]
-
-                if isinstance(shap_values, list):
-                    # Multi-output model (e.g. classifier): shap_values is list of arrays
-                    sv_use = shap_values[pred_class]
-                else:
-                    # Single output (e.g. binary classifier just outputting logit or prob)
-                    sv_use = shap_values
-
-                # Clean shap_values array (values might be strings '[0.01]')
-                try:
-                    sv_use = np.array(sv_use, dtype=float)
-                except (ValueError, TypeError):
-                    # Fallback to element-wise cleaning
-                    vf = np.vectorize(safe_float)
-                    sv_use = vf(sv_use)
-
-                # Robustly extract scalar base value
-                base_use = shap_expected
-                if hasattr(shap_expected, "__iter__") and not isinstance(shap_expected, str):
-                     base_arr = np.array(shap_expected).ravel()
-                     if len(base_arr) > 1:
-                         # Use same class index
-                         base_use = base_arr[pred_class] if pred_class < len(base_arr) else base_arr[0]
-                     elif len(base_arr) == 1:
-                         base_use = base_arr[0]
-                
-                # Use safe_float to handle brackets in string output
-                base_val = safe_float(base_use)
-                
-                # Clamp reconstruction for probabilities
-                shap_recon = float(base_val + np.sum(sv_use))
-                shap_recon = max(0.0, min(1.0, shap_recon))
-                
-                # fidelity here as 1 - abs error (bounded), MVP proxy
-                shap_fidelity = max(0.0, 1.0 - abs(model_out - shap_recon))
-            except Exception as e:
-                st.warning(f"SHAP Fidelity Calculation Failed: {e}")
-                shap_fidelity = None
-        except Exception as e:
-            st.error(f"SHAP Explainer Failed: {e}")
-            shap_fidelity = None
-            shap_values = None
-
-    # --- Scores ---
-    lime_score = explanation_confidence_score(lime_stability, lime_fidelity, lime_latency_ms, latency_target_ms=float(latency_target))
-    shap_score = None
-    if shap_latency_ms is not None and shap_fidelity is not None:
-        shap_score = explanation_confidence_score(shap_stability, shap_fidelity, float(shap_latency_ms), latency_target_ms=float(latency_target))
-
-    # --- Disagreement flag (simple, defendable) ---
-    disagreement_flag = False
-    # Compare top-k from LIME run-0 against SHAP top-k if available
     shap_topk = None
-    if model_name in ["RandomForest", "XGBoost"] or (model_name == "MLP" and use_kernel_shap):
+    shap_csv_data = None
+    shap_jaccard_scores = []
+    shap_mean_jaccard = None
+    shap_std_jaccard = None
+    shap_min_jaccard = None
+    shap_var_jaccard = None
+    shap_is_deterministic = None
+    explainer_type = None
+    shap_background_size_logged = None
+    shap_values = None
+    sv_use = None
+    model_output_space = "probability"
+    explained_class_idx = None
+    shap_fx = None
+    shap_reconstruction = None
+    shap_additivity_error = None
+    shap_additivity_warning = None
+    kernel_nsamples_logged = None
+    background_size_logged = None
+    background_fixed_logged = None
+    cold_start_logged = True
+    shap_latency_ms_mean, shap_latency_ms_std, shap_latency_ms_p95 = None, None, None
+
+    if model_name in ["RandomForest", "HistGradientBoosting", "MLP"] and (model_name != "MLP" or use_kernel_shap):
         try:
-            import shap as _shap
-            
-            # Reconstruct top-k from shap_values calculated above
-            if shap_values is not None:
-                if isinstance(shap_values, list):
-                    sv_use = shap_values[1] if len(shap_values) > 1 else shap_values[0]
-                else:
-                    sv_use = shap_values
+            tree_model = None
+            if model_name in ["RandomForest", "HistGradientBoosting"]:
+                tree_model = tree_model_main
+                model_output_space = "raw" if model_name == "HistGradientBoosting" else "probability"
+                explainer_type = "TreeSHAP"
+                rng_bg = np.random.default_rng(int(seed))
+                bg_size_tree = int(min(200, len(X_train)))
+                bg_idx_tree = rng_bg.choice(len(X_train), size=bg_size_tree, replace=False)
+                bg_fixed = X_train[bg_idx_tree]
+                shap_background_size_logged = int(bg_size_tree)
+                background_size_logged = int(bg_size_tree)
+                background_fixed_logged = True
+            else:
+                explainer_type = "KernelSHAP"
+                shap_background_size_logged = int(min(KERNEL_SHAP_BACKGROUND_SIZE, len(X_train)))
+                kernel_nsamples_logged = int(kernel_shap_nsamples)
+                background_size_logged = int(shap_background_size_logged)
+                background_fixed_logged = False
+
+            rng = np.random.default_rng(int(seed))
+            if model_name in ["RandomForest", "HistGradientBoosting"]:
+                import shap
+                t0_shap = time.perf_counter()
+                tree_explainer = shap.TreeExplainer(tree_model, data=bg_fixed, model_output=model_output_space)
+                shap_values_r = tree_explainer.shap_values(x_instance.reshape(1, -1))
+                shap_latency_r = (time.perf_counter() - t0_shap) * 1000.0
+                expected_value_r = tree_explainer.expected_value
+                probs = tree_model.predict_proba(x_instance.reshape(1, -1))[0]
+                pred_class = int(np.argmax(probs))
+                sv_r = normalize_shap_values(shap_values_r, pred_class)
+                abs_sv = np.abs(sv_r)
+                order = np.argsort(-abs_sv)
+                topk_features = [feature_cols[i] for i in order[:int(TOP_K)]]
+                shap_feature_sets.append(set(topk_features))
+                shap_latencies.append(shap_latency_r)
+                sv_use = sv_r
+                shap_values = shap_values_r
+                explained_class_idx = int(pred_class)
+                base_val_r = pick_base_value(expected_value_r, pred_class)
+                shap_fx = model_output_for_class(tree_model, x_instance, pred_class, model_output_space)
+                shap_reconstruction = float(base_val_r + np.sum(sv_r))
+                shap_additivity_error = float(abs(shap_fx - shap_reconstruction))
+                shap_additivity_warning = bool(shap_additivity_error > ADDITIVITY_WARNING_THRESHOLD)
+            else:
+                for r in range(int(shap_runs)):
+                    shap_values_r = None
+                    expected_value_r = None
+                    shap_latency_r = 0.0
+                    bg_idx = rng.choice(len(X_train), size=shap_background_size_logged, replace=False)
+                    bg = X_train[bg_idx]
+                    shap_values_r, expected_value_r, shap_latency_r, kernel_meta = shap_explain_instance_kernel(
+                        predict_proba_fn, bg, x_instance, nsamples=int(kernel_shap_nsamples)
+                    )
+                    probs = predict_proba_fn(x_instance.reshape(1, -1))[0]
+                    kernel_nsamples_logged = int(kernel_meta.get("kernel_nsamples", kernel_shap_nsamples))
+                    background_size_logged = int(kernel_meta.get("background_size", shap_background_size_logged))
+
+                    pred_class = int(np.argmax(probs))
+                    sv_r = normalize_shap_values(shap_values_r, pred_class)
+                    abs_sv = np.abs(sv_r)
+                    order = np.argsort(-abs_sv)
+                    topk_features = [feature_cols[i] for i in order[:int(TOP_K)]]
+                    shap_feature_sets.append(set(topk_features))
+                    shap_latencies.append(shap_latency_r)
+                    sv_use = sv_r
+                    shap_values = shap_values_r
+                    explained_class_idx = int(pred_class)
+                    base_val_r = pick_base_value(expected_value_r, pred_class)
+                    shap_fx = float(probs[pred_class])
+                    shap_reconstruction = float(base_val_r + np.sum(sv_r))
+                    shap_additivity_error = float(abs(shap_fx - shap_reconstruction))
+                    shap_additivity_warning = bool(shap_additivity_error > ADDITIVITY_WARNING_THRESHOLD)
+
+            shap_jaccard_scores = pairwise_jaccard_scores(shap_feature_sets)
+            shap_mean_jaccard = float(np.mean(shap_jaccard_scores)) if shap_jaccard_scores else 1.0
+            shap_std_jaccard = float(np.std(shap_jaccard_scores)) if shap_jaccard_scores else 0.0
+            shap_min_jaccard = float(np.min(shap_jaccard_scores)) if shap_jaccard_scores else 1.0
+            shap_var_jaccard = float(np.var(shap_jaccard_scores)) if shap_jaccard_scores else 0.0
+            shap_is_deterministic = bool(shap_min_jaccard == 1.0)
+
+            shap_stability = shap_mean_jaccard
+            shap_latency_ms_mean, shap_latency_ms_std, shap_latency_ms_p95 = summarize_latencies(shap_latencies)
+            shap_latency_ms = float(shap_latency_ms_mean) if shap_latency_ms_mean is not None else None
+            if sv_use is not None:
                 abs_sv = np.abs(sv_use).ravel()
                 order = np.argsort(-abs_sv)
-                shap_topk = [feature_cols[i] for i in order[:int(num_features)]]
-                j = len(set(shap_topk) & set(topk_from_lime(lime_explanations[0], int(num_features)))) / max(1, len(set(shap_topk) | set(topk_from_lime(lime_explanations[0], int(num_features)))))
-                disagreement_flag = (j < 0.5)
-        except Exception:
-            shap_topk = None
+                shap_topk = [feature_cols[i] for i in order[:int(TOP_K)]]
+                shap_df = pd.DataFrame({"Feature": feature_cols, "SHAP Value": sv_use.ravel()})
+                shap_df["Abs"] = shap_df["SHAP Value"].abs()
+                shap_df = shap_df.sort_values("Abs", ascending=False).drop(columns=["Abs"])
+                shap_csv_data = shap_df.to_csv(index=False)
+        except Exception as e:
+            st.error(f"SHAP Explainer Failed: {e}")
+    else:
+        shap_latency_ms_mean, shap_latency_ms_std, shap_latency_ms_p95 = None, None, None
+
+    # --- Fidelity (R2 reconstruction over N instances) ---
+    eval_n = int(min(Fidelity_N, len(X_test)))
+    fidelity_indices = np.arange(eval_n)
+
+    lime_true_probs = []
+    lime_recon_probs = []
+    for i in fidelity_indices:
+        x_i = X_test[i]
+        probs_i = predict_proba_fn(x_i.reshape(1, -1))[0]
+        pred_label_i = int(np.argmax(probs_i))
+        true_prob_i = float(probs_i[pred_label_i])
+        recon_i, _, _ = lime_recon_for_instance(x_i, seed_val=int(seed) + i)
+        lime_true_probs.append(true_prob_i)
+        lime_recon_probs.append(float(recon_i))
+    lime_fidelity = fidelity_r2(np.array(lime_true_probs), np.array(lime_recon_probs))
+
+    shap_fidelity = None
+    if model_name in ["RandomForest", "HistGradientBoosting"] or (model_name == "MLP" and use_kernel_shap):
+        shap_true_probs = []
+        shap_recon_probs = []
+        if model_name in ["RandomForest", "HistGradientBoosting"]:
+            tree_model_f = tree_model_main
+            import shap
+            model_output_space_f = "raw" if model_name == "HistGradientBoosting" else "probability"
+            tree_explainer_f = shap.TreeExplainer(tree_model_f, model_output=model_output_space_f)
+            expected_value = tree_explainer_f.expected_value
+            X_eval = X_test[fidelity_indices]
+            probs_eval = tree_model_f.predict_proba(X_eval)
+            shap_vals_eval = tree_explainer_f.shap_values(X_eval)
+            for row_i, i in enumerate(fidelity_indices):
+                probs_i = probs_eval[row_i]
+                pred_class_i = int(np.argmax(probs_i))
+                sv_i = normalize_shap_values_row(shap_vals_eval, row_i, pred_class_i)
+                base_val = pick_base_value(expected_value, pred_class_i)
+                recon_i = float(base_val + np.sum(sv_i))
+                x_i = X_eval[row_i]
+                shap_true_probs.append(model_output_for_class(tree_model_f, x_i, pred_class_i, model_output_space_f))
+                shap_recon_probs.append(recon_i)
+        else:
+            rng_f = np.random.default_rng(int(seed))
+            bg_idx_f = rng_f.choice(len(X_train), size=int(min(KERNEL_SHAP_BACKGROUND_SIZE, len(X_train))), replace=False)
+            bg_f = X_train[bg_idx_f]
+            import shap
+            kernel_explainer_f = shap.KernelExplainer(predict_proba_fn, bg_f)
+            for i in fidelity_indices:
+                x_i = X_test[i]
+                probs_i = predict_proba_fn(x_i.reshape(1, -1))[0]
+                pred_class_i = int(np.argmax(probs_i))
+                shap_vals_i = kernel_explainer_f.shap_values(x_i.reshape(1, -1), nsamples=int(kernel_shap_nsamples))
+                sv_i = normalize_shap_values(shap_vals_i, pred_class_i)
+                exp_val = kernel_explainer_f.expected_value
+                base_val = pick_base_value(exp_val, pred_class_i)
+                recon_i = float(base_val + np.sum(sv_i))
+                shap_true_probs.append(float(probs_i[pred_class_i]))
+                shap_recon_probs.append(recon_i)
+        shap_fidelity = fidelity_r2(np.array(shap_true_probs), np.array(shap_recon_probs))
+
+    fidelity_difference = float(shap_fidelity - lime_fidelity) if shap_fidelity is not None else None
+
+    latency_ratio = None
+    meets_10x_threshold = None
+    if shap_latency_ms_mean is not None and lime_latency_ms_mean and lime_latency_ms_mean > 0:
+        latency_ratio = float(shap_latency_ms_mean / lime_latency_ms_mean)
+        meets_10x_threshold = bool(latency_ratio > 10.0)
+
+    lime_score = explanation_confidence_score(
+        lime_stability, lime_fidelity, float(lime_latency_ms_mean), latency_target_ms=float(latency_target)
+    )
+    shap_score = None
+    if shap_latency_ms is not None and shap_fidelity is not None and shap_stability is not None:
+        shap_score = explanation_confidence_score(
+            shap_stability, shap_fidelity, float(shap_latency_ms_mean), latency_target_ms=float(latency_target)
+        )
+
+    disagreement_flag = False
+    if shap_topk and lime_explanations:
+        lime_topk_set = set([f for f, _ in lime_explanations[0][:int(TOP_K)]])
+        shap_topk_set = set(shap_topk)
+        inter = len(lime_topk_set & shap_topk_set)
+        union = len(lime_topk_set | shap_topk_set)
+        l_vs_s_jacc = inter / max(1, union)
+        disagreement_flag = (l_vs_s_jacc < 0.5)
+
+    # --- Prepare SHAP CSV Data (Fallback if not created in loop) ---
+    if shap_csv_data is None and shap_topk is not None:
+         shap_csv_data = pd.DataFrame({"Feature": shap_topk}).to_csv(index=False)
+
 
     # --- Display results ---
     st.subheader("Audit Results")
@@ -417,13 +635,19 @@ if run_btn:
 
     with colA:
         st.markdown("### LIME")
-        st.metric("Stability (mean pairwise Jaccard)", f"{lime_stability:.3f}")
-        st.metric("Fidelity (local R² proxy)", f"{lime_fidelity:.3f}")
-        st.metric("Latency (ms, avg)", f"{lime_latency_ms:.1f}")
+        st.metric("Stability Mean Jaccard", f"{lime_stability:.3f}")
+        st.metric("Jaccard Std", f"{lime_std_jaccard:.4f}")
+        st.metric("Jaccard Min", f"{lime_min_jaccard:.3f}")
+        st.metric("Jaccard Variance", f"{lime_var_jaccard:.4f}")
+        st.metric("Unstable (var > 0.01)", str(lime_is_unstable))
+        st.metric("Mean Jaccard (< 0.9)", str(lime_supports_h1_jaccard))
+        st.metric("Fidelity (R2)", f"{lime_fidelity:.3f}" if lime_fidelity is not None else "N/A")
+        st.metric("Latency (ms, mean)", f"{lime_latency_ms_mean:.1f}" if lime_latency_ms_mean is not None else "N/A")
+
         st.metric("Explanation Confidence Score", f"{lime_score:.3f}")
 
         st.write("Top-K features (Run 1):")
-        st.write(pd.DataFrame(lime_explanations[0], columns=["Feature", "Weight"]).head(int(num_features)))
+        st.write(pd.DataFrame(lime_explanations[0], columns=["Feature", "Weight"]).head(int(TOP_K)))
 
     with colB:
         st.markdown("### SHAP")
@@ -432,16 +656,29 @@ if run_btn:
         else:
             stab_label = "Stability"
             if model_name == "MLP" and use_kernel_shap:
-                stab_label = "Approximation (KernelSHAP)"
-                st.metric(stab_label, f"Running with {kernel_shap_nsamples} samples")
-            else:
-                st.metric(stab_label, "1.000 (deterministic)")
-            st.metric("Fidelity (reconstruction proxy)", f"{shap_fidelity:.3f}" if shap_fidelity is not None else "N/A")
-            st.metric("Latency (ms)", f"{float(shap_latency_ms):.1f}" if shap_latency_ms is not None else "N/A")
+                stab_label = "Stability (KernelSHAP Jaccard)"
+            
+            st.metric(stab_label, f"{shap_stability:.3f}" if shap_stability is not None else "N/A")
+            st.metric("Jaccard Std", f"{shap_std_jaccard:.4f}" if shap_std_jaccard is not None else "N/A")
+            st.metric("Jaccard Min", f"{shap_min_jaccard:.3f}" if shap_min_jaccard is not None else "N/A")
+            st.metric("Jaccard Variance", f"{shap_var_jaccard:.4f}" if shap_var_jaccard is not None else "N/A")
+            st.metric("Deterministic", str(shap_is_deterministic) if shap_is_deterministic is not None else "N/A")
+            st.metric("Fidelity (R2)", f"{shap_fidelity:.3f}" if shap_fidelity is not None else "N/A")
+            st.metric("Latency (ms, mean)", f"{float(shap_latency_ms_mean):.1f}" if shap_latency_ms_mean is not None else "N/A")
+            st.metric("Latency Ratio (SHAP/LIME)", f"{latency_ratio:.2f}" if latency_ratio is not None else "N/A")
+            st.metric("Meets >10x threshold", str(meets_10x_threshold) if meets_10x_threshold is not None else "N/A")
             st.metric("Explanation Confidence Score", f"{shap_score:.3f}" if shap_score is not None else "N/A")
             if shap_topk:
                 st.write("Top-K features (SHAP |abs|):")
                 st.write(pd.DataFrame({"Feature": shap_topk}))
+            if shap_additivity_warning:
+                st.warning(
+                    f"SHAP additivity warning: error={shap_additivity_error:.6f} > {ADDITIVITY_WARNING_THRESHOLD}"
+                )
+
+    st.caption(f"Fidelity evaluated as R2 reconstruction over N={eval_n} test instances. Top-K fixed at {TOP_K}.")
+    if fidelity_difference is not None:
+        st.caption(f"Fidelity difference (SHAP - LIME): {fidelity_difference:.4f}")
 
     if disagreement_flag:
         st.error("⚠️ Explanation disagreement detected (low overlap between LIME and SHAP top-K). Interpret with caution.")
@@ -452,9 +689,11 @@ if run_btn:
     st.subheader("Diagnostics")
     fig = plt.figure()
     plt.hist(lime_latencies, bins=10)
+    plt.title("LIME Latency Distribution (Repeated Runs)")
     plt.xlabel("LIME Latency (ms)")
     plt.ylabel("Count")
     st.pyplot(fig)
+    st.caption("SHAP is deterministic for tree models; distribution not shown.")
     
     # Save high-res plot to bytes for download
     plot_buf = io.BytesIO()
@@ -465,39 +704,101 @@ if run_btn:
     # --- Log run ---
     record = {
         "dataset": "uploaded_csv" if uploaded is not None else "synthetic_demo",
+        "audit_schema": AUDIT_SCHEMA,
+        "model_name": model_name,
         "model": model_name,
         "instance_idx": int(idx),
         "lime_runs": int(lime_runs),
-        "top_k": int(num_features),
-        "lime_stability_jaccard": lime_stability,
-        "lime_fidelity_r2": lime_fidelity,
-        "lime_latency_ms_avg": lime_latency_ms,
+        "shap_runs": int(shap_runs),
+        "top_k": int(TOP_K),
+        "prediction_confidence": float(prediction_confidence),
+        "near_boundary": bool(near_boundary),
+        "fidelity_strategy": "r2_reconstruction_additive",
+        "fidelity_eval_n": int(eval_n),
+        "lime_stability_jaccard": float(lime_stability),
+        "lime_mean_jaccard": float(lime_mean_jaccard),
+        "lime_std_jaccard": float(lime_std_jaccard),
+        "lime_min_jaccard": float(lime_min_jaccard),
+        "lime_var_jaccard": float(lime_var_jaccard),
+        "lime_is_unstable_var_gt_0_01": bool(lime_is_unstable),
+        "lime_supports_h1_jaccard_lt_0_9": bool(lime_supports_h1_jaccard),
+        "lime_r2_fidelity": float(lime_fidelity) if lime_fidelity is not None else None,
+        "lime_latency_ms": float(lime_latency_ms_mean) if lime_latency_ms_mean is not None else None,
+        "lime_latency_ms_avg": float(lime_latency_ms_mean) if lime_latency_ms_mean is not None else None,
+        "lime_latency_ms_mean": float(lime_latency_ms_mean) if lime_latency_ms_mean is not None else None,
+        "lime_latency_ms_std": float(lime_latency_ms_std) if lime_latency_ms_std is not None else None,
+        "lime_latency_ms_p95": float(lime_latency_ms_p95) if lime_latency_ms_p95 is not None else None,
         "lime_confidence_score": lime_score,
-        "shap_latency_ms": float(shap_latency_ms) if shap_latency_ms is not None else None,
-        "shap_fidelity_proxy": float(shap_fidelity) if shap_fidelity is not None else None,
+        "shap_latency_ms": float(shap_latency_ms_mean) if shap_latency_ms_mean is not None else None,
+        "shap_latency_ms_mean": float(shap_latency_ms_mean) if shap_latency_ms_mean is not None else None,
+        "shap_latency_ms_std": float(shap_latency_ms_std) if shap_latency_ms_std is not None else None,
+        "shap_latency_ms_p95": float(shap_latency_ms_p95) if shap_latency_ms_p95 is not None else None,
+        "shap_r2_fidelity": float(shap_fidelity) if shap_fidelity is not None else None,
+        "fidelity_difference": float(fidelity_difference) if fidelity_difference is not None else None,
         "shap_confidence_score": float(shap_score) if shap_score is not None else None,
+        "shap_stability_jaccard": float(shap_stability) if shap_stability is not None else None,
+        "shap_mean_jaccard": float(shap_mean_jaccard) if shap_mean_jaccard is not None else None,
+        "shap_std_jaccard": float(shap_std_jaccard) if shap_std_jaccard is not None else None,
+        "shap_min_jaccard": float(shap_min_jaccard) if shap_min_jaccard is not None else None,
+        "shap_var_jaccard": float(shap_var_jaccard) if shap_var_jaccard is not None else None,
+        "shap_is_deterministic": bool(shap_is_deterministic) if shap_is_deterministic is not None else None,
+        "deterministic_flag": bool(shap_is_deterministic) if shap_is_deterministic is not None else None,
+        "explainer_type": explainer_type,
+        "model_output_space": model_output_space if shap_latency_ms is not None else None,
+        "explained_class_idx": int(explained_class_idx) if explained_class_idx is not None else None,
+        "shap_fx": float(shap_fx) if shap_fx is not None else None,
+        "shap_reconstruction": float(shap_reconstruction) if shap_reconstruction is not None else None,
+        "shap_additivity_error": float(shap_additivity_error) if shap_additivity_error is not None else None,
+        "shap_additivity_warning": bool(shap_additivity_warning) if shap_additivity_warning is not None else None,
+        "kernel_nsamples": int(kernel_nsamples_logged) if kernel_nsamples_logged is not None else None,
+        "background_size": int(background_size_logged) if background_size_logged is not None else None,
+        "background_fixed": bool(background_fixed_logged) if background_fixed_logged is not None else None,
+        "cold_start": bool(cold_start_logged),
+        "kernelshap_background_size": int(shap_background_size_logged) if shap_background_size_logged is not None else None,
+        "latency_ratio": float(latency_ratio) if latency_ratio is not None else None,
+        "meets_10x_threshold": bool(meets_10x_threshold) if meets_10x_threshold is not None else None,
+        "explainer": "LIME",
+        "mean_jaccard": float(lime_mean_jaccard),
+        "var_jaccard": float(lime_var_jaccard),
+        "r2_fidelity": float(lime_fidelity) if lime_fidelity is not None else None,
+        "latency_ms": float(lime_latency_ms_mean) if lime_latency_ms_mean is not None else None,
         "disagreement_flag": bool(disagreement_flag),
         "seed": int(seed),
     }
     append_jsonl(record)
-    
+
     # --- Save state for persistence ---
     st.session_state["audit_results"] = {
         "lime_stability": lime_stability,
+        "lime_mean_jaccard": lime_mean_jaccard,
+        "lime_std_jaccard": lime_std_jaccard,
+        "lime_min_jaccard": lime_min_jaccard,
+        "lime_var_jaccard": lime_var_jaccard,
+        "lime_is_unstable": lime_is_unstable,
+        "lime_supports_h1_jaccard": lime_supports_h1_jaccard,
         "lime_fidelity": lime_fidelity,
         "lime_latency_ms": lime_latency_ms,
         "lime_score": lime_score,
         "lime_explanations": lime_explanations,
         "lime_latencies": lime_latencies,
         "shap_stability": shap_stability,
+        "shap_mean_jaccard": shap_mean_jaccard,
+        "shap_std_jaccard": shap_std_jaccard,
+        "shap_min_jaccard": shap_min_jaccard,
+        "shap_var_jaccard": shap_var_jaccard,
+        "shap_is_deterministic": shap_is_deterministic,
         "shap_fidelity": shap_fidelity,
         "shap_latency_ms": shap_latency_ms,
+        "latency_ratio": latency_ratio,
+        "meets_10x_threshold": meets_10x_threshold,
+        "fidelity_difference": fidelity_difference,
+        "explainer_type": explainer_type,
+        "kernelshap_background_size": shap_background_size_logged,
         "shap_score": shap_score,
         "shap_topk": shap_topk,
+        "shap_csv_data": shap_csv_data,
         "disagreement_flag": disagreement_flag,
         "sv_use": sv_use if 'sv_use' in locals() else None,
-        "feature_cols": feature_cols,
-        "model_name_run": model_name,
         "feature_cols": feature_cols,
         "model_name_run": model_name,
         "idx_run": idx,
@@ -517,10 +818,9 @@ if "audit_results" in st.session_state:
     shap_latency_ms = res["shap_latency_ms"]
     shap_score = res["shap_score"]
     shap_topk = res["shap_topk"]
+    shap_csv_data = res.get("shap_csv_data")
     disagreement_flag = res["disagreement_flag"]
     sv_use = res["sv_use"]
-    feature_cols_run = res["feature_cols"]
-    model_name_run = res["model_name_run"]
     feature_cols_run = res["feature_cols"]
     model_name_run = res["model_name_run"]
     idx_run = res["idx_run"]
@@ -579,26 +879,10 @@ if "audit_results" in st.session_state:
         mime="text/csv"
     )
 
-    if shap_topk:
-        # Reconstruct full SHAP df if possible, or just top-k
-        # For MVP we just reused top-k in display, but let's try to pass the full values if available
-        # We reused sv_use and feature_cols earlier
-        try:
-            # sv_use is already clean numpy array here
-            # feature_cols is full list
-             shap_df = pd.DataFrame({
-                 "Feature": feature_cols_run,
-                 "SHAP Value": sv_use.ravel()
-             })
-             # Sort by magnitude
-             shap_df["Abs"] = shap_df["SHAP Value"].abs()
-             shap_df = shap_df.sort_values("Abs", ascending=False).drop(columns=["Abs"])
-             
-             st.download_button(
-                label="Download SHAP Explanations (CSV)",
-                data=shap_df.to_csv(index=False),
-                file_name=f"shap_explanation_{model_name_run}_{idx_run}.csv",
-                mime="text/csv"
-            )
-        except Exception:
-            pass
+    if shap_csv_data:
+        st.download_button(
+            label="Download SHAP Explanations (CSV)",
+            data=shap_csv_data,
+            file_name=f"shap_explanation_{model_name_run}_{idx_run}.csv",
+            mime="text/csv"
+        )
