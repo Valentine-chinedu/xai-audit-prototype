@@ -24,18 +24,28 @@ def lime_explain_instance(X_train, feature_names, class_names, predict_proba_fn,
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     # exp.as_list() returns list of tuples (feature_str, weight)
+    # also return map to get raw feature indices for fidelity check
     as_list = exp.as_list()
-    return as_list, latency_ms
+    as_map = exp.as_map()
+    details = {
+        "intercept": exp.intercept,
+        "local_pred": getattr(exp, "local_pred", None),
+        "predict_proba": getattr(exp, "predict_proba", None),
+    }
+    return as_list, as_map, latency_ms, details
 
-def shap_explain_instance_tree(model, X_background, x_instance):
+def shap_explain_instance_tree(model, X_background, x_instance, model_output="probability"):
     # TreeSHAP for tree models (RF, XGBoost)
     t0 = time.perf_counter()
-    explainer = shap.TreeExplainer(model, data=X_background)
+    if X_background is None:
+        explainer = shap.TreeExplainer(model, model_output=model_output)
+    else:
+        explainer = shap.TreeExplainer(model, data=X_background, model_output=model_output)
     shap_values = explainer.shap_values(x_instance.reshape(1, -1))
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     # shap_values can be list for multiclass; for binary, may be array or list
-    return shap_values, latency_ms
+    return shap_values, explainer.expected_value, latency_ms
 
 def shap_explain_instance_kernel(predict_proba_fn, X_background, x_instance, nsamples=100):
     """Kernel SHAP for non-tree models."""
@@ -49,7 +59,11 @@ def shap_explain_instance_kernel(predict_proba_fn, X_background, x_instance, nsa
     shap_values = explainer.shap_values(x_2d, nsamples=nsamples)
     latency_ms = (time.perf_counter() - t0) * 1000.0
     
-    return shap_values, explainer.expected_value, latency_ms
+    metadata = {
+        "kernel_nsamples": int(nsamples),
+        "background_size": int(len(X_background)),
+    }
+    return shap_values, explainer.expected_value, latency_ms, metadata
 
 def topk_from_lime(lime_list, k=10):
     # lime_list: [(feature_desc, weight), ...]
