@@ -61,7 +61,7 @@ def test_aopc_calculation():
         return cumulative_drop / len(top_k_indices)
 
     # 3. Test with top 5 features
-    # Let's just assume features 0-4 are important
+    
     top_k_indices = [0, 1, 2, 3, 4]
     
     print("\n--- Testing AOPC Calculation ---")
