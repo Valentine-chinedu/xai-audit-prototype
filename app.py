@@ -75,7 +75,10 @@ def preprocess_for_modeling(df: pd.DataFrame, target_col: str):
     
     # Drop empty cols
     missing_frac = df.isna().mean()
-    drop_cols = list(missing_frac[missing_frac > 0.5].index)
+    drop_cols = [
+        c for c in missing_frac[missing_frac > 0.5].index
+        if c != target_col
+    ]
     if drop_cols:
          st.warning(f"Dropping columns with >50% missing values: {', '.join(drop_cols)}")
          df = df.drop(columns=drop_cols)
@@ -187,9 +190,13 @@ if uploaded is not None:
         df_raw = clean_uploaded_df(df_raw)
         
         all_cols = list(df_raw.columns)
+        if not all_cols:
+            raise ValueError("The CSV has no usable columns.")
         
         # Heuristic for default target
-        default_ix = 0
+        # Most tabular CSVs place the response column last. Use that as the
+        # fallback instead of silently selecting the first feature or ID column.
+        default_ix = max(0, len(all_cols) - 1)
         for i, c in enumerate(all_cols):
             if c.lower() in ["target", "label", "class", "y", "two_year_recid", "recid", "outcome"]:
                 default_ix = i
@@ -207,9 +214,15 @@ else:
     target_is_continuous = False
 
 st.subheader("Dataset Preview")
-st.dataframe(df.head(10), use_container_width=True)
+st.dataframe(df.head(10), width="stretch")
 
 X = df[feature_cols].values
+if not feature_cols:
+    st.error("No usable feature columns remain after preprocessing.")
+    st.stop()
+if len(df) < 4:
+    st.error("At least 4 rows with non-missing target values are required.")
+    st.stop()
 try:
     X = X.astype(np.float64)
 except ValueError as e:
@@ -217,16 +230,25 @@ except ValueError as e:
     st.stop()
 y = df[target_col].values
 
-# Encode target for classification
-if not locals().get('target_is_continuous', False):
-    le = LabelEncoder()
-    y = le.fit_transform(y)
-    class_names = [str(c) for c in le.classes_]
-else:
-    # Regression or manual binning
-    class_names = [str(c) for c in np.unique(y)]
+# All models and explainers in this prototype are classification-only. Letting a
+# continuous response reach train_test_split/model.fit produces scikit-learn's
+# confusing "unique classes" warning (and eventually a training error).
+if locals().get("target_is_continuous", False):
+    st.error(
+        f"'{target_col}' looks continuous or has too many unique numeric values "
+        "for a classification target. Select a categorical/class-label target "
+        "column, or convert this target into discrete classes before uploading."
+    )
+    st.stop()
 
-# split
+# Encode target for classification
+le = LabelEncoder()
+y = le.fit_transform(y)
+class_names = [str(c) for c in le.classes_]
+if len(class_names) < 2:
+    st.error("The target column must contain at least two distinct classes.")
+    st.stop()
+
 # split
 stratify_y = y if (len(np.unique(y)) > 1 and np.min(np.unique(y, return_counts=True)[1]) > 1) else None
 X_train, X_test, y_train, y_test = train_test_split(
@@ -441,6 +463,7 @@ if run_btn:
     background_fixed_logged = None
     cold_start_logged = True
     shap_latency_ms_mean, shap_latency_ms_std, shap_latency_ms_p95 = None, None, None
+    shap_succeeded = False
 
     if model_name in ["RandomForest", "HistGradientBoosting", "MLP"] and (model_name != "MLP" or use_kernel_shap):
         try:
@@ -514,9 +537,10 @@ if run_btn:
                     base_val_r = pick_base_value(expected_value_r, pred_class)
                     shap_fx = float(probs[pred_class])
                     shap_reconstruction = float(base_val_r + np.sum(sv_r))
-                    shap_additivity_error = float(abs(shap_fx - shap_reconstruction))
-                    shap_additivity_warning = bool(shap_additivity_error > ADDITIVITY_WARNING_THRESHOLD)
+                shap_additivity_error = float(abs(shap_fx - shap_reconstruction))
+                shap_additivity_warning = bool(shap_additivity_error > ADDITIVITY_WARNING_THRESHOLD)
 
+            shap_succeeded = bool(shap_feature_sets and sv_use is not None)
             shap_jaccard_scores = pairwise_jaccard_scores(shap_feature_sets)
             shap_mean_jaccard = float(np.mean(shap_jaccard_scores)) if shap_jaccard_scores else 1.0
             shap_std_jaccard = float(np.std(shap_jaccard_scores)) if shap_jaccard_scores else 0.0
@@ -557,19 +581,33 @@ if run_btn:
     lime_fidelity = fidelity_r2(np.array(lime_true_probs), np.array(lime_recon_probs))
 
     shap_fidelity = None
-    if model_name in ["RandomForest", "HistGradientBoosting"] or (model_name == "MLP" and use_kernel_shap):
+    if shap_succeeded:
         shap_true_probs = []
         shap_recon_probs = []
         if model_name in ["RandomForest", "HistGradientBoosting"]:
             tree_model_f = tree_model_main
             import shap
             model_output_space_f = "raw" if model_name == "HistGradientBoosting" else "probability"
-            tree_explainer_f = shap.TreeExplainer(tree_model_f, model_output=model_output_space_f)
+            # Supplying a background dataset selects interventional TreeSHAP.
+            # Probability output is not supported by the default
+            # tree_path_dependent perturbation mode.
+            rng_tree_f = np.random.default_rng(int(seed))
+            bg_size_tree_f = int(min(200, len(X_train)))
+            bg_idx_tree_f = rng_tree_f.choice(
+                len(X_train), size=bg_size_tree_f, replace=False
+            )
+            bg_tree_f = X_train[bg_idx_tree_f]
+            tree_explainer_f = shap.TreeExplainer(
+                tree_model_f,
+                data=bg_tree_f,
+                feature_perturbation="interventional",
+                model_output=model_output_space_f,
+            )
             expected_value = tree_explainer_f.expected_value
             X_eval = X_test[fidelity_indices]
             probs_eval = tree_model_f.predict_proba(X_eval)
             shap_vals_eval = tree_explainer_f.shap_values(X_eval)
-            for row_i, i in enumerate(fidelity_indices):
+            for row_i, _ in enumerate(fidelity_indices):
                 probs_i = probs_eval[row_i]
                 pred_class_i = int(np.argmax(probs_i))
                 sv_i = normalize_shap_values_row(shap_vals_eval, row_i, pred_class_i)
